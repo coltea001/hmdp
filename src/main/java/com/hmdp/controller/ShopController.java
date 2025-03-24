@@ -1,15 +1,21 @@
 package com.hmdp.controller;
 
 
+import cn.hutool.core.util.BooleanUtil;
 import cn.hutool.core.util.StrUtil;
+import cn.hutool.json.JSONUtil;
 import com.baomidou.mybatisplus.extension.plugins.pagination.Page;
 import com.hmdp.dto.Result;
 import com.hmdp.entity.Shop;
 import com.hmdp.service.IShopService;
 import com.hmdp.utils.SystemConstants;
+import org.springframework.data.redis.core.StringRedisTemplate;
+import org.springframework.transaction.annotation.Transactional;
 import org.springframework.web.bind.annotation.*;
 
 import javax.annotation.Resource;
+import java.sql.Struct;
+import java.util.concurrent.TimeUnit;
 
 /**
  * <p>
@@ -26,14 +32,64 @@ public class ShopController {
     @Resource
     public IShopService shopService;
 
+    @Resource
+    private StringRedisTemplate stringRedisTemplate;
+
     /**
      * 根据id查询商铺信息
      * @param id 商铺id
      * @return 商铺详情数据
      */
     @GetMapping("/{id}")
-    public Result queryShopById(@PathVariable("id") Long id) {
-        return Result.ok(shopService.getById(id));
+    public Result queryShopById(@PathVariable("id") Long id){
+            String shopJson = stringRedisTemplate.opsForValue().get("cache:shop:" + id);
+
+            if (StrUtil.isNotBlank(shopJson)) {
+                Shop shop = JSONUtil.toBean(shopJson, Shop.class);
+                return Result.ok(shop);
+            }
+
+            if (shopJson == "") {
+                return Result.fail("店铺信息不存在！");
+            }
+
+            String lockKey = "lock:shop:" + id;
+            Shop shop = null;
+
+        try {
+            boolean isLock = tryLock(lockKey);
+            if (!isLock) {
+                Thread.sleep(50);
+                return queryShopById(id);
+            }
+
+            shop = shopService.getById(id);
+
+            if (shop == null) {
+                stringRedisTemplate.opsForValue().set("cache:shop:" + id, "", 3, TimeUnit.MINUTES);
+                return Result.fail("店铺信息不存在！");
+            }
+
+            stringRedisTemplate.opsForValue().set("cache:shop:" + id, JSONUtil.toJsonStr(shop), 30, TimeUnit.MINUTES);
+        }catch (InterruptedException e) {
+            e.printStackTrace();
+        }
+        finally {
+            unLock(lockKey);
+        }
+
+
+        return Result.ok(shop);
+    }
+
+    private boolean tryLock(String lockKey) {
+        Boolean isLock = stringRedisTemplate.opsForValue().setIfAbsent(lockKey, "1", 10, TimeUnit.SECONDS);
+        return BooleanUtil.isTrue(isLock);
+    }
+
+    private void unLock(String lockKey) {
+        stringRedisTemplate.delete(lockKey);
+        return;
     }
 
     /**
@@ -42,9 +98,14 @@ public class ShopController {
      * @return 商铺id
      */
     @PostMapping
+    @Transactional
     public Result saveShop(@RequestBody Shop shop) {
         // 写入数据库
+        if(shop.getId()==null){
+            return Result.fail("店铺不能为空！");
+        }
         shopService.save(shop);
+        stringRedisTemplate.delete("cache:shop:"+shop.getId());
         // 返回店铺id
         return Result.ok(shop.getId());
     }
